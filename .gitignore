@@ -1,0 +1,22 @@
+# Data and models (large or regenerated — never commit)
+data/
+csv/
+jpeg/
+outputs/
+*.keras
+*.h5
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.streamlit/secrets.toml
+*.bak
+prototype_backup.py
+*.bak
+prototype_backup.py
