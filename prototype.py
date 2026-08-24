@@ -16,6 +16,7 @@ Usage
     python prototype.py                       # synthetic data, quick demo
     python prototype.py --data_dir data       # real images in data/benign, data/malignant
     python prototype.py --data_dir data --regularised   # second ablation tier
+    python prototype.py --data_dir data --transfer      # third ablation tier (EfficientNet)
     python prototype.py --epochs 15 --img_size 160
 """
 
@@ -160,6 +161,59 @@ def build_model(img_size, regularised=False):
     return model
 
 
+def build_transfer_model(img_size, finetune=False):
+    """The third ablation tier: transfer learning from EfficientNetB0.
+
+    EfficientNet was pretrained on ImageNet, so it expects three-channel RGB input
+    and its own preprocessing. Two adaptations bridge the gap from this project's
+    single-channel grayscale mammograms. First, the one grayscale channel is
+    repeated three times so the pretrained network receives the shape it expects.
+    Second, the network's own preprocess_input is applied rather than the simple
+    rescaling used by the from-scratch tiers, so pixel statistics match what the
+    pretrained weights were trained on.
+
+    The convolutional base is frozen and only a small new head is trained, which
+    is the point of transfer learning: the base already knows generic visual
+    features from a million images, so on a few hundred mammograms only the final
+    classification layer needs to learn, which is where the gain over training
+    from scratch is expected. Light augmentation and class weighting from the
+    regularised tier are kept, since the imbalance and small sample still apply.
+    """
+    from tensorflow.keras.applications import EfficientNetB0
+    from tensorflow.keras.applications.efficientnet import preprocess_input
+
+    inputs = layers.Input((img_size, img_size, 1))
+    x = layers.RandomFlip("horizontal")(inputs)
+    x = layers.RandomRotation(0.05)(x)
+    x = layers.RandomZoom(0.10)(x)
+    # grayscale -> 3-channel RGB for the pretrained base
+    x = layers.Concatenate()([x, x, x])
+    x = preprocess_input(x)
+
+    base = EfficientNetB0(include_top=False, weights="imagenet",
+                          input_shape=(img_size, img_size, 3))
+    if finetune:
+        # Fine-tuning: unfreeze the top ~20% of the base so its higher-level
+        # features can adapt to mammograms, while the low-level layers stay frozen.
+        base.trainable = True
+        cutoff = int(len(base.layers) * 0.8)
+        for layer in base.layers[:cutoff]:
+            layer.trainable = False
+    else:
+        base.trainable = False  # freeze the pretrained features entirely
+    x = base(x, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dropout(0.40)(x)
+    outputs = layers.Dense(1, activation="sigmoid")(x)
+
+    model = keras.Model(inputs, outputs)
+    lr = 1e-4 if finetune else 1e-3  # gentler rate when adapting pretrained weights
+    model.compile(optimizer=keras.optimizers.Adam(lr),
+                  loss="binary_crossentropy",
+                  metrics=["accuracy", keras.metrics.AUC(name="auc")])
+    return model
+
+
 def class_weights_from(train_ds):
     """Compute inverse-frequency class weights so the minority (malignant) class
     carries more influence during training. Returns None if a label is absent."""
@@ -209,9 +263,20 @@ def main():
     ap.add_argument("--n", type=int, default=600, help="synthetic sample size")
     ap.add_argument("--regularised", action="store_true",
                     help="second ablation tier: augmentation, heavier dropout, class weighting")
+    ap.add_argument("--transfer", action="store_true",
+                    help="third ablation tier: transfer learning from EfficientNetB0")
+    ap.add_argument("--finetune", action="store_true",
+                    help="transfer tier variant: also fine-tune the top layers of the base")
     args = ap.parse_args()
 
-    tier = "regularised" if args.regularised else "baseline"
+    if args.transfer and args.finetune:
+        tier = "transfer-finetuned"
+    elif args.transfer:
+        tier = "transfer"
+    elif args.regularised:
+        tier = "regularised"
+    else:
+        tier = "baseline"
     print("TensorFlow", tf.__version__)
     print("Tier:", tier)
     gpus = tf.config.list_physical_devices("GPU")
@@ -228,11 +293,14 @@ def main():
         train_ds, val_ds, test_ds, class_names = synthetic_datasets(args.n, args.img_size)
 
     print("Classes:", class_names)
-    model = build_model(args.img_size, regularised=args.regularised)
+    if args.transfer:
+        model = build_transfer_model(args.img_size, finetune=args.finetune)
+    else:
+        model = build_model(args.img_size, regularised=args.regularised)
     model.summary()
 
     fit_kwargs = dict(validation_data=val_ds, epochs=args.epochs, verbose=2)
-    if args.regularised:
+    if args.regularised or args.transfer:
         cw = class_weights_from(train_ds)
         if cw:
             print("Class weights:", cw)
@@ -264,7 +332,14 @@ def main():
 
     save_plots(history, cm, class_names)
     os.makedirs(OUT, exist_ok=True)
-    model_name = "regularised_cnn.keras" if args.regularised else "baseline_cnn.keras"
+    if args.transfer and args.finetune:
+        model_name = "transfer_finetuned_cnn.keras"
+    elif args.transfer:
+        model_name = "transfer_cnn.keras"
+    elif args.regularised:
+        model_name = "regularised_cnn.keras"
+    else:
+        model_name = "baseline_cnn.keras"
     model.save(f"{OUT}/{model_name}")
     print(f"Saved model and plots to '{OUT}/'")
 
