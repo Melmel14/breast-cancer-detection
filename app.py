@@ -3,9 +3,9 @@ BC Detect — dual-pathway breast cancer detection tool.
 
 A thin application layer over the trained models, realising the progressive
 disclosure design: a clear recommendation first, a confidence level second, and
-the supporting evidence third. The imaging pathway is wired to the trained
-baseline CNN; the classical pathway is scaffolded and marked as forthcoming until
-its models are trained.
+the supporting evidence third. Both pathways are wired to their trained models:
+the imaging pathway to the CNN and the classical pathway to the saved SVM. A
+separate researcher view documents the model benchmarking.
 
 Run with:
     streamlit run app.py
@@ -64,7 +64,8 @@ def load_classical_reference():
         from sklearn.datasets import load_breast_cancer
         ds = load_breast_cancer()
         names = list(ds.feature_names)
-        # take a handful of each class but return them unlabelled and shuffled
+        # take a handful of each class but return them unlabelled and shuffled,
+        # so the demo does not reveal the diagnosis before the model predicts it
         import numpy as np
         mal = ds.data[ds.target == 0][:5]
         ben = ds.data[ds.target == 1][:5]
@@ -94,13 +95,31 @@ def predict_image(model, pil_image):
 # Shared UI helpers
 # ----------------------------------------------------------------------------
 def header():
+    st.markdown(
+        """
+        <style>
+          /* Restrained clinical palette: calm teal accent, meaning-carrying status colours only */
+          h3 { color: #0f5c5c; }
+          .stApp [data-testid="stMetricValue"] { color: #0f5c5c; }
+          div[data-testid="stExpander"] summary { color: #0f5c5c; }
+          .stProgress > div > div > div { background-color: #128a8a; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.markdown("### 🩺 BC Detect")
     st.caption("A second-reader decision-support tool. A clinician always makes the final decision.")
 
 
 def nav():
-    views = ["New case", "Result", "Benchmarks"]
+    # The clinician-facing tool has just two views: start a case, and read the
+    # result. The benchmarking view is a researcher/evaluation view and is kept
+    # separate (see the sidebar) so a clinical user is not dropped into a table of
+    # model metrics they have no reason to interpret.
+    views = ["New case", "Result"]
     if "view_radio" not in st.session_state:
+        st.session_state.view_radio = "New case"
+    if st.session_state.view_radio not in views:
         st.session_state.view_radio = "New case"
     return st.radio(
         "View", views,
@@ -130,19 +149,22 @@ def _choose_pathway(pathway):
 # ----------------------------------------------------------------------------
 def screen_new_case():
     st.subheader("How would you like to assess this case?")
+    st.caption("Choose one of the two options below, depending on what information "
+               "you have for this patient.")
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.markdown("**Pathway A — Cytology features**")
-        st.caption("Enter the numeric measurements from a fine needle aspirate, "
-                   "in the style of the Wisconsin dataset. Runs the classical models.")
-        st.button("Select cytology pathway", use_container_width=True,
+        st.markdown("**Option A — Cell measurements**")
+        st.caption("Use this when you have the numeric measurements from a fine-needle "
+                   "aspirate (the Wisconsin cytology features). Assessed by the "
+                   "classical models.")
+        st.button("Use cell measurements", use_container_width=True,
                   on_click=_choose_pathway, args=("classical",))
 
     with col_b:
-        st.markdown("**Pathway B — Mammogram image**")
-        st.caption("Upload a mammogram as PNG or JPEG. The image is preprocessed "
-                   "and passed to the trained convolutional network.")
+        st.markdown("**Option B — Mammogram image**")
+        st.caption("Use this when you have a mammogram image. Upload it as PNG or JPEG "
+                   "and it is assessed by the trained image model.")
         uploaded = st.file_uploader("Upload mammogram", type=["png", "jpg", "jpeg"],
                                     label_visibility="collapsed", key="mammogram_upload",
                                     on_change=_choose_imaging)
@@ -151,8 +173,8 @@ def screen_new_case():
             st.session_state.pathway = "imaging"
 
     st.divider()
-    st.caption("Built accessible from the start: every result carries a word and an "
-               "icon, not colour alone, and the views above can be revisited at any time.")
+    st.caption("Accessible by design: every result shows a word and an icon, never "
+               "colour alone, and you can return to this screen at any time.")
 
 
 # ----------------------------------------------------------------------------
@@ -170,7 +192,7 @@ def screen_result():
 
 
 def _result_imaging():
-    st.subheader("Case result — imaging pathway")
+    st.subheader("Case result — mammogram image")
     from PIL import Image
 
     data = st.session_state.get("uploaded_bytes")
@@ -228,7 +250,7 @@ def _load_sample_case(examples, n):
 
 
 def _result_classical():
-    st.subheader("Case result — cytology pathway")
+    st.subheader("Case result — cell measurements")
 
     import json
     import numpy as np
@@ -248,10 +270,11 @@ def _result_classical():
                "aspirate report below. The model then predicts benign or malignant; it "
                "is not told the answer in advance.")
 
+    # Demo shortcut, clearly labelled as such. It loads one real patient's
     # measurements at random WITHOUT revealing the diagnosis, so the prediction is
     # a genuine test rather than a given. Manual entry remains the real workflow.
     dcol, _ = st.columns([1, 2])
-    dcol.button("Load a random sample case",
+    dcol.button("Load a random sample case (demo)",
                 on_click=_load_sample_case, args=(examples, len(feature_names)),
                 disabled=not examples)
 
@@ -302,32 +325,63 @@ def _result_classical():
 # Screen 3 — benchmarking (Figma "Model benchmarking")
 # ----------------------------------------------------------------------------
 def screen_benchmarks():
-    st.subheader("Model benchmarking")
-    st.caption("Performance on the held-out test set, shown beside a radiologist-level "
-               "benchmark from the literature. Figures are from real CBIS-DDSM runs.")
+    st.subheader("Model benchmarking (for researchers)")
+    st.markdown(
+        "This page compares how well each model performs. It is **not** needed to "
+        "assess a patient; it documents how the models were evaluated."
+    )
+    with st.expander("What do these numbers mean?", expanded=True):
+        st.markdown(
+            "- **Sensitivity** — of the cancers present, the share the model correctly "
+            "catches. This is the most important number, because missing a cancer is "
+            "the most serious error.\n"
+            "- **Specificity** — of the healthy cases, the share correctly cleared "
+            "(fewer false alarms).\n"
+            "- **AUC** — an overall score for how well the model separates cancer from "
+            "healthy, from 0.5 (no better than guessing) to 1.0 (perfect).\n"
+            "- **Accuracy** — the share of all cases classified correctly. It can look "
+            "high while still missing cancers, so it is not the headline number here."
+        )
 
-    rows = [
-        ("Baseline CNN", 0.632, 0.716, 0.544, 0.694),
-        ("Regularised CNN", 0.663, 0.799, 0.519, 0.703),
-        ("Transfer learning", None, None, None, None),
-        ("Classical models", None, None, None, None),
-        ("Shen et al. (2019)", None, None, None, 0.895),
+    st.markdown("**Image models** — trained on mammogram images (CBIS-DDSM)")
+    img_rows = [
+        ("Baseline", 0.632, 0.716, 0.544, 0.694),
+        ("Regularised (best image model)", 0.663, 0.799, 0.519, 0.703),
+        ("Transfer learning", 0.611, 0.787, 0.425, 0.649),
+        ("Transfer, fine-tuned", 0.602, 0.698, 0.500, 0.665),
+        ("Radiologist-level benchmark — Shen et al. (2019)", None, None, None, 0.895),
+    ]
+    clf_rows = [
+        ("Support vector machine (best overall)", 0.982, 0.976, 0.986, 0.995),
+        ("Logistic regression", 0.974, 0.952, 0.986, 0.995),
+        ("Random forest", 0.965, 0.905, 1.000, 0.997),
+        ("Gradient boosting", 0.965, 0.905, 1.000, 0.995),
+        ("K-nearest neighbours", 0.956, 0.905, 0.986, 0.982),
+        ("Published benchmark — Agarap (2018)", 0.990, None, None, None),
     ]
 
     def fmt(v):
         return "—" if v is None else f"{v:.3f}"
 
-    st.table({
-        "Model": [r[0] for r in rows],
-        "Accuracy": [fmt(r[1]) for r in rows],
-        "Sensitivity": [fmt(r[2]) for r in rows],
-        "Specificity": [fmt(r[3]) for r in rows],
-        "AUC": [fmt(r[4]) for r in rows],
-    })
+    def show(rows):
+        st.table({
+            "Model": [r[0] for r in rows],
+            "Accuracy": [fmt(r[1]) for r in rows],
+            "Sensitivity": [fmt(r[2]) for r in rows],
+            "Specificity": [fmt(r[3]) for r in rows],
+            "AUC": [fmt(r[4]) for r in rows],
+        })
 
-    st.caption("Sensitivity leads: a missed malignancy is the costliest error, so it "
-               "is weighted above raw accuracy. Regularisation raised sensitivity from "
-               "0.716 to 0.799. Transfer learning and the classical models are the next work.")
+    show(img_rows)
+    st.markdown("**Cell-measurement models** — trained on the Wisconsin cytology features")
+    show(clf_rows)
+
+    st.info(
+        "In short: the cell-measurement models are very strong (around 0.95–0.98 "
+        "sensitivity), because those measurements are already a clean summary of the "
+        "cells. The image models are more modest on raw mammograms, which is a much "
+        "harder task. This contrast is the project's main finding."
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -335,14 +389,24 @@ def screen_benchmarks():
 # ----------------------------------------------------------------------------
 def main():
     header()
-    view = nav()
 
+    # Researcher / evaluation view, kept out of the clinician's path. A user must
+    # deliberately open it from the sidebar, so a nurse using the tool is never
+    # dropped into a table of model-performance metrics.
+    with st.sidebar:
+        st.markdown("**For researchers**")
+        st.caption("Model evaluation details, not needed to assess a case.")
+        show_benchmarks = st.toggle("Show model benchmarking", value=False)
+
+    if show_benchmarks:
+        screen_benchmarks()
+        return
+
+    view = nav()
     if view == "New case":
         screen_new_case()
-    elif view == "Result":
-        screen_result()
     else:
-        screen_benchmarks()
+        screen_result()
 
 
 if __name__ == "__main__":
