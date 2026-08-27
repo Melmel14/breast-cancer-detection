@@ -24,7 +24,7 @@ MODEL_PATH = os.environ.get("BCDETECT_MODEL", "outputs/baseline_cnn.keras")
 IMG_SIZE = 128
 CLASS_NAMES = ["benign", "malignant"]
 
-st.set_page_config(page_title="BC Detect", page_icon="🩺", layout="centered")
+st.set_page_config(page_title="Breast Cancer Detection Assistant", page_icon="🩺", layout="centered")
 
 
 # ----------------------------------------------------------------------------
@@ -91,6 +91,89 @@ def predict_image(model, pil_image):
     return label, confidence, prob_malignant
 
 
+def _last_conv_layer_name(model):
+    """Find the name of the last convolutional layer, which Grad-CAM needs.
+    Returns None if the model has no conv layer (so the caller can skip the map)."""
+    import tensorflow as tf
+    for layer in reversed(model.layers):
+        # a 4D output tensor indicates a spatial (conv/pool) feature map
+        try:
+            shape = layer.output.shape
+        except Exception:
+            continue
+        if len(shape) == 4:
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                return layer.name
+    # fall back to the last 4D layer of any kind
+    for layer in reversed(model.layers):
+        try:
+            if len(layer.output.shape) == 4:
+                return layer.name
+        except Exception:
+            continue
+    return None
+
+
+def gradcam_overlay(model, pil_image):
+    """Return a PIL image of the mammogram with a Grad-CAM heatmap overlaid, showing
+    which regions most influenced the prediction. Returns None if it cannot be
+    produced, so the result screen degrades gracefully to just the prediction."""
+    try:
+        import tensorflow as tf
+        import matplotlib.cm as cm
+        from PIL import Image as PILImage
+
+        img = pil_image.convert("L").resize((IMG_SIZE, IMG_SIZE))
+        arr = np.array(img, dtype="float32").reshape(1, IMG_SIZE, IMG_SIZE, 1)
+
+        layer_name = _last_conv_layer_name(model)
+        if layer_name is None:
+            return None
+
+        # Build the grad model by explicitly chaining the model's layers, which is
+        # robust for models loaded from disk (accessing model.output directly on a
+        # loaded Sequential model is unreliable in Keras 3). Split the layer stack
+        # at the target conv layer: run up to it to get the feature maps, then run
+        # the remaining layers to get the prediction, all inside the gradient tape.
+        layers_list = list(model.layers)
+        names = [l.name for l in layers_list]
+        idx = names.index(layer_name)
+
+        with tf.GradientTape() as tape:
+            x = tf.convert_to_tensor(arr)
+            conv_out = None
+            for i, layer in enumerate(layers_list):
+                x = layer(x)
+                if i == idx:
+                    conv_out = x
+                    tape.watch(conv_out)
+                    # continue feeding forward from here
+                    y = x
+                    for later in layers_list[i + 1:]:
+                        y = later(y)
+                    score = y[:, 0]
+                    break
+        grads = tape.gradient(score, conv_out)
+        if grads is None:
+            return None
+        pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
+        conv_out = conv_out[0]
+        heat = tf.reduce_sum(conv_out * pooled, axis=-1)
+        heat = tf.maximum(heat, 0) / (tf.reduce_max(heat) + 1e-8)
+        heat = heat.numpy()
+
+        heat_img = PILImage.fromarray(np.uint8(255 * heat)).resize(
+            (IMG_SIZE, IMG_SIZE), PILImage.BILINEAR)
+        colormap = cm.get_cmap("jet")
+        colored = np.uint8(255 * colormap(np.array(heat_img) / 255.0)[:, :, :3])
+
+        base = np.array(img.convert("RGB"))
+        blended = np.uint8(0.55 * base + 0.45 * colored)
+        return PILImage.fromarray(blended)
+    except Exception:
+        return None
+
+
 # ----------------------------------------------------------------------------
 # Shared UI helpers
 # ----------------------------------------------------------------------------
@@ -107,7 +190,7 @@ def header():
         """,
         unsafe_allow_html=True,
     )
-    st.markdown("### 🩺 BC Detect")
+    st.markdown("### 🩺 Breast Cancer Detection Assistant")
     st.caption("A second-reader decision-support tool. A clinician always makes the final decision.")
 
 
@@ -226,12 +309,22 @@ def _result_imaging():
     # Level 3: the evidence, tucked behind an expander
     with st.expander("Why this result"):
         st.write(
-            f"The network output a malignancy probability of **{prob:.2f}** for this "
-            f"image. Values at or above 0.50 are reported as malignant. This is a "
-            f"single baseline model and is not a diagnosis; it is a flag for "
-            f"specialist review."
+            f"The network read the mammogram image directly and output a malignancy "
+            f"probability of **{prob:.2f}**. Values at or above 0.50 are reported as "
+            f"malignant. This is a single imaging model and is not a diagnosis; it is "
+            f"a flag for specialist review."
         )
-        st.image(image, caption="Uploaded mammogram", width=280)
+        heatmap = gradcam_overlay(model, image)
+        if heatmap is not None:
+            st.write("**Where the model looked**")
+            st.caption("The warmer (red) areas are the regions of the image that most "
+                       "influenced the result, showing the model is reading the image "
+                       "itself rather than any outside information.")
+            c1, c2 = st.columns(2)
+            c1.image(image, caption="Uploaded mammogram", width=240)
+            c2.image(heatmap, caption="Regions the model focused on", width=240)
+        else:
+            st.image(image, caption="Uploaded mammogram", width=280)
 
     st.caption("This is a flag for specialist review, not a diagnosis. A clinician makes the final decision.")
 

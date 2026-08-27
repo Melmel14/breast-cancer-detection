@@ -20,3 +20,5 @@ __pycache__/
 prototype_backup.py
 *.bak
 prototype_backup.py
+archive/
+mias_data/
